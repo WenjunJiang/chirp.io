@@ -154,15 +154,12 @@ class Chirp():
         freq = self.dsp.max_freq(data)
         ch, f = min(self.map.items(), key=lambda kv: abs(kv[1] - freq))
 
-        if ((chirplen == 0 and ch == 'h') or
-                (chirplen == 1 and ch == 'j') or
-                    (chirplen > 1 and chirplen < 20)):
-            self.chirp += ch
-            chirplen += 1
-        if chirplen == 20:
+        self.chirp += ch
+        chirplen = len(self.chirp)
+        self.chirp = self.chirp[1:] if chirplen > 20 else self.chirp
+        # print(self.chirp)
+        if chirplen >= 20 and self.chirp[0:2] == 'hj':
             self.decode(self.chirp)
-        if chirplen >= 20:
-            self.chirp = ''
 
     def decode(self, chirp):
         """ Run error correction on chirp and get content """
