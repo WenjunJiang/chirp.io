@@ -2,35 +2,32 @@
 """
 Chirp.io Encoder/Decoder
 """
-import os
 import sys
-import wave
 import time
-import magic
 import string
 import pyaudio
-import reedsolo
 import requests
 import argparse
 import threading
 import webbrowser
 import numpy as np
 
-MIN_AMPLITUDE = 2500
+MIN_AMPLITUDE = 500
 SAMPLE_RATE = 44100.0  # Hz
-SAMPLE_LENGTH = 3  # sec
+CHAR_DURATION = 0.0872  # secs
 
 
 class Audio():
     """ Audio Processing """
-    CHUNK = 4096
-    FORMAT = pyaudio.paInt16
     CHANNELS = 1
-    RATE = SAMPLE_RATE
     HUMAN_RANGE = 20000
+    FORMAT = pyaudio.paInt16
+    RATE = int(SAMPLE_RATE)
+    CHUNK = int(SAMPLE_RATE * CHAR_DURATION)
 
-    def __init__(self):
+    def __init__(self, callback):
         self.audio = pyaudio.PyAudio()
+        self.callback = callback
 
     def __del__(self):
         try:
@@ -38,59 +35,25 @@ class Audio():
         except:
             pass
 
-    def record(self, seconds, filename=None):
-        """ Record audio from system microphone """
-        frames = []
-        stream = self.audio.open(format=self.FORMAT,
-                                 channels=self.CHANNELS,
-                                 rate=int(self.RATE),
-                                 input=True,
-                                 frames_per_buffer=self.CHUNK)
-
-        for i in range(0, int(self.RATE / self.CHUNK * seconds)):
-            data = stream.read(self.CHUNK)
-            frames.append(data)
-
-        if filename:
-            self.write(frames, filename)
-
-        stream.stop_stream()
-        stream.close()
-
-        return b''.join(frames)
+    def record(self):
+        self.stream = self.audio.open(
+            format=self.FORMAT,
+            channels=self.CHANNELS,
+            rate=self.RATE,
+            input=True,
+            frames_per_buffer=self.CHUNK,
+            stream_callback=self.callback
+        )
 
     def play(self, frames):
         """ Write data to system audio buffer"""
         stream = self.audio.open(format=pyaudio.paInt16,
                                  channels=1,
-                                 rate=int(self.RATE),
+                                 rate=self.RATE,
                                  output=True)
         stream.write(frames, len(frames))
         stream.stop_stream()
         stream.close()
-
-    def read(self, filename):
-        """ Read wave file """
-        wf = wave.open(filename, 'rb')
-        buf = bytearray()
-
-        chunk = wf.readframes(self.CHUNK)
-        buf.extend(chunk)
-
-        while chunk != '':
-            chunk = wf.readframes(self.CHUNK)
-            buf.extend(chunk)
-
-        return buf
-
-    def write(self, frames, filename):
-        """ Write wave file """
-        wf = wave.open(filename, 'wb')
-        wf.setnchannels(self.CHANNELS)
-        wf.setsampwidth(self.audio.get_sample_size(self.FORMAT))
-        wf.setframerate(self.RATE)
-        wf.writeframes(b''.join(frames))
-        wf.close()
 
 
 class Signal():
@@ -125,21 +88,19 @@ class Signal():
 
 class Chirp():
     """ Chirp Encoding/Decoding
-        http://www.chirp.io/technology """
+        chirp.io/technology """
     RATE = SAMPLE_RATE
-    CHAR_LENGTH = 0.0872  # duration of one chirp character - 87.2ms
+    CHAR_LENGTH = CHAR_DURATION  # duration of one chirp character - 87.2ms
     CHAR_SAMPLES = CHAR_LENGTH * RATE  # number of samples in one chirp character
     CHIRP_SAMPLES = CHAR_SAMPLES * 20  # number of samples in an entire chirp
     CHIRP_VOLUME = 2 ** 16 / 48  # quarter of max amplitude
-    GET_URL = 'http://labs.chirp.io/get'
-    POST_URL = 'http://labs.chirp.io/chirp'
-    FILE_URL = 'http://labs.chirp.io/file'
+    BASE_URL = 'https://api.chirp.io/v1/chirps'
 
     def __init__(self):
+        self.chirp = ''
         self.map = self.get_map()
         self.chars = sorted(self.map.keys())
         self.dsp = Signal(self.RATE)
-        self.rs = reedsolo.RSCodec(nsym=8, nsize=20, prim=0x25, generator=2, c_exp=5)
 
     def get_map(self):
         """ Construct map of chirp characters to frequencies
@@ -158,33 +119,17 @@ class Chirp():
     def get_code(self, url):
         """ Request a long code from chirp API """
         try:
-            r = requests.post(self.POST_URL, {'url': url})
+            r = requests.post(self.BASE_URL,
+                              data=dict(url=url))
             rsp = r.json()
             if 'longcode' in rsp:
                 return 'hj' + rsp['longcode']
             elif 'error' in rsp:
-                print(rsp['error']['msg'])
+                print(rsp['description'])
                 sys.exit(-1)
         except:
             print('Server failed to respond')
             sys.exit(-1)
-
-    def get_file_code(self, filename, filetype):
-        """ Request a long code for a file from chirp API """
-        try:
-            headers = {'Content-Type': filetype, 'Accept': 'application/json'}
-            params = {'title': os.path.basename(filename)}
-            r = requests.post(self.FILE_URL, files={filename: open(filename, 'rb')},
-                              headers=headers, params=params)
-            rsp = r.json()
-            if 'longcode' in rsp:
-                return 'hj' + rsp['longcode']
-            elif 'error' in rsp:
-                print(rsp['error']['msg'])
-                sys.exit(-1)
-        except:
-           print('Server failed to respond')
-           sys.exit(-1)
 
     def get_char(self, data):
         """ Find maximum frequency in fft data then find the closest
@@ -193,34 +138,51 @@ class Chirp():
         ch, f = min(self.map.items(), key=lambda kv: abs(kv[1] - freq))
         return ch
 
-    def decode(self, data):
-        """ Try and find a chirp in the data, and decode into a string """
-        s = 0
-        chirp = ''
+    def callback(self, data, frames, info, status):
+        """ Callback from pyaudio once a chars worth
+            of data is loaded into the buffer """
+        audio = np.fromstring(data, dtype=np.int16)
+        if max(audio) > MIN_AMPLITUDE:
+            thread = DecodeThread(self.process, audio)
+            thread.start()
+        return (None, pyaudio.paContinue)
 
-        # check for frontdoor pair
-        chirp += self.get_char(data[s:s+int(self.CHAR_SAMPLES)])
-        s += self.CHAR_SAMPLES
-        if chirp != 'h':
-            return 1
-        chirp += self.get_char(data[int(s):int(s+self.CHAR_SAMPLES)])
-        s += self.CHAR_SAMPLES
-        if chirp != 'hj':
-            return 2
+    def process(self, data):
+        """ Search for any chirps in the data, once the
+            frontdoor pair is received, keep processing. """
+        chirplen = len(self.chirp)
+        freq = self.dsp.max_freq(data)
+        ch, f = min(self.map.items(), key=lambda kv: abs(kv[1] - freq))
 
-        for i in range(2, 20):
-            chirp += self.get_char(data[int(s):int(s+self.CHAR_SAMPLES)])
-            s += self.CHAR_SAMPLES
+        if ((chirplen == 0 and ch == 'h') or
+                (chirplen == 1 and ch == 'j') or
+                    (chirplen > 1 and chirplen < 20)):
+            self.chirp += ch
+            chirplen += 1
+        if chirplen == 20:
+            self.decode(self.chirp)
+        if chirplen >= 20:
+            self.chirp = ''
 
-        return chirp
+    def decode(self, chirp):
+        """ Run error correction on chirp and get content """
+        print('Found Chirp!')
+        print(chirp)
+        # code = self.ecc_decode(chirp)
+        # r = requests.get(self.BASE_URL + '/' + chirp[2:12])
+        # if r.status_code == 200:
+        #     rsp = r.json()
+        #     # print (chirp_code)
+        #     print('%s' % rsp['data'])
+        #     if rsp['data'].get('url'):
+        #         webbrowser.open(rsp['data']['url'])
 
-    def encode(self, chirp, internal=False):
+    def encode(self, code):
         """ Generate audio data from a chirp string """
         samples = np.array([], dtype=np.int16)
-        if internal:
-            chirp = self.ecc(chirp, encode=internal)
+        # code = self.ecc_encode(code)
 
-        for s in chirp:
+        for s in code:
             freq = self.map[s]
             char = self.dsp.sine_wave(freq, self.CHAR_LENGTH)
             samples = np.concatenate([samples, char])
@@ -228,145 +190,59 @@ class Chirp():
         samples = (samples * self.CHIRP_VOLUME).astype(np.int16)
         return samples
 
-    def search(self, data):
-        """ Search data for audio, and try and decode """
-        s = 0
-        chirp_code = None
-        datalen = len(data)
+    def ecc_encode(self, code):
+        """ Reed Solomon Error Correction Encoding """
+        r = requests.get(self.BASE_URL + '/encode/' + code)
+        rsp = r.json()
+        return rsp['longcode']
 
-        if data.argmax() < MIN_AMPLITUDE:
-            return
-
-        while s < datalen - self.CHIRP_SAMPLES:
-            # search for start of audio
-            if data[int(s)] > MIN_AMPLITUDE:
-                # check for any chirps, if unsuccessful
-                # carry on searching..
-                chirp_code = self.decode(data[int(s):])
-                # advance pointer by searched data
-                if isinstance(chirp_code, int):
-                    s += chirp_code * self.CHAR_SAMPLES
-                else:
-                    # try and perform error correction
-                    corrected = self.ecc(chirp_code)
-                    if corrected:
-                        chirp_code = corrected
-
-                    r = requests.get(self.GET_URL + '/' + chirp_code[2:12])
-                    if r.status_code == 200:
-                        print('\nFound Chirp!')
-                        rsp = r.json()
-                        # print (chirp_code)
-                        print('URL: %s' % rsp['url'])
-                        if 'data' in rsp and 'description' in rsp['data']:
-                            print(rsp['data']['description'])
-                        webbrowser.open(rsp['url'])
-                        return
-            s += 1
-
-    def string_to_list(self, s):
-        """ Convert string to list for reed solomon """
-        arr = []
-        for i in s:
-            arr.append(self.chars.index(i))
-        return arr
-
-    def list_to_string(self, a):
-        """ Convert list to string for reed solomon """
-        s = ''
-        for i in a:
-            s += self.chars[i]
-        return s
-
-    def ecc(self, data, encode=False):
-        """ Reed Solomon Error Correction """
-        try:
-            if encode:
-                arr = self.string_to_list(data[0:12])
-                out = self.rs.encode(arr)
-                return self.list_to_string(out)
-            else:  # decode
-                arr = self.string_to_list(data)
-                out = self.rs.decode(arr)
-                return self.list_to_string(out)
-
-        except reedsolo.ReedSolomonError:
-            return None
+    def ecc_decode(self, longcode):
+        """ Reed Solomon Error Correction Decoding """
+        r = requests.get(self.BASE_URL + '/decode/' + longcode)
+        rsp = r.json()
+        return rsp['shortcode']
 
 
 class DecodeThread(threading.Thread):
     """ Thread to run digital signal processing functions """
-
-    def __init__(self, fn, quit=False):
+    def __init__(self, fn, *args):
         self.fn = fn
-        self.data = None
-        self.quit = quit
-        self.window = np.array([], dtype=np.int16)
+        self.args = args
         threading.Thread.__init__(self)
 
     def run(self):
-        while not self.quit:
-            if self.data is not None:
-                # add data to window so we don't miss any chirps
-                d1, d2 = np.array_split(self.data, 2)
-                w1, w2 = np.array_split(self.window, 2)
-                self.window = np.concatenate([w2, d1])
-                self.fn(self.window)
-                w1, w2 = np.array_split(self.window, 2)
-                self.window = np.concatenate([w2, d2])
-                self.fn(self.window)
-                self.data = None
-            time.sleep(SAMPLE_LENGTH)
+        self.fn(*self.args)
 
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description='Chirp.io Encoder/Decoder')
     parser.add_argument('-l', '--listen', action='store_true', default=False, help='listen out for a chirp')
-    parser.add_argument('-i', '--internal', action='store_true', default=False, help='use internal error correction')
     parser.add_argument('-u', '--url', help='chirp a url')
     parser.add_argument('-c', '--code', help='chirp a code')
-    parser.add_argument('-f', '--file', help='chirp a file, path to either a jpg, png or pdf')
     args = parser.parse_args()
 
     chirp = Chirp()
-    audio = Audio()
-    dsp = Signal(SAMPLE_RATE)
+    audio = Audio(chirp.callback)
 
     if args.listen:
         try:
-            thread = DecodeThread(chirp.search)
-            thread.start()
             print('Recording...')
-
-            while (True):
-                buf = audio.record(SAMPLE_LENGTH)
-                thread.data = np.frombuffer(buf, dtype=np.int16)
+            audio.record()
+            time.sleep(300)
 
         except KeyboardInterrupt:
             print('Exiting..')
-            thread.quit = True
             sys.exit(0)
 
     elif args.code:
-        samples = chirp.encode(args.code, internal=args.internal)
+        samples = chirp.encode(args.code)
         print('Chirping code: %s' % args.code)
         audio.play(samples)
 
     elif args.url:
         code = chirp.get_code(args.url)
-        samples = chirp.encode(code, internal=args.internal)
+        samples = chirp.encode(code)
         print('Chirping url: %s' % args.url)
-        audio.play(samples)
-
-    elif args.file:
-        filetype = magic.from_file(args.file, mime=True)
-        if filetype not in ('image/jpeg', 'image/png', 'application/pdf'):
-            print('Filetype not supported')
-            sys.exit(-1)
-
-        code = chirp.get_file_code(args.file, filetype)
-        samples = chirp.encode(code, internal=args.internal)
-        print('Chirping file: %s' % args.file)
         audio.play(samples)
 
     else:
