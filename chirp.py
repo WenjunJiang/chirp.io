@@ -4,6 +4,7 @@ Chirp.io Encoder/Decoder
 """
 import sys
 import time
+import uuid
 import string
 import pyaudio
 import requests
@@ -94,14 +95,17 @@ class Chirp():
     CHAR_SAMPLES = CHAR_LENGTH * RATE  # number of samples in one chirp character
     CHIRP_SAMPLES = CHAR_SAMPLES * 20  # number of samples in an entire chirp
     CHIRP_VOLUME = 2 ** 16 / 48  # quarter of max amplitude
-    BASE_URL = 'https://api.chirp.io/v1/chirps'
+    BASE_URL = 'https://api.chirp.io/v1'
 
     def __init__(self):
         self.chirp = ''
         self.amplitude = MIN_AMPLITUDE
         self.map = self.get_map()
+        self.device = str(uuid.uuid1())
         self.chars = sorted(self.map.keys())
         self.dsp = Signal(self.RATE)
+        self.token = self.authenticate()
+        self.headers = {'X-Auth-Token': self.token}
 
     def get_map(self):
         """ Construct map of chirp characters to frequencies
@@ -120,14 +124,22 @@ class Chirp():
     def get_code(self, url):
         """ Request a long code from chirp API """
         try:
-            r = requests.post(self.BASE_URL,
-                              data=dict(url=url))
-            rsp = r.json()
-            if 'longcode' in rsp:
-                return 'hj' + rsp['longcode']
-            elif 'error' in rsp:
-                print(rsp['description'])
-                sys.exit(-1)
+            payload = {
+                'public': True,
+                'data': {'url': url}
+            }
+            r = requests.post(
+                self.BASE_URL + '/chirps',
+                headers = self.headers,
+                json=payload
+            )
+            if r.status_code == 201:
+                rsp = r.json()
+                if 'longcode' in rsp:
+                    return 'hj' + rsp['longcode']
+                elif 'error' in rsp:
+                    print(rsp['description'])
+                    sys.exit(-1)
         except:
             print('Server failed to respond')
             sys.exit(-1)
@@ -159,27 +171,41 @@ class Chirp():
         self.chirp += ch
         chirplen = len(self.chirp)
         self.chirp = self.chirp[1:] if chirplen > 20 else self.chirp
-        # print(self.chirp)
         if chirplen >= 20 and self.chirp[0:2] == 'hj':
             self.decode(self.chirp)
 
-    def decode(self, chirp):
+    def authenticate(self):
+        """ Convert an app key/secret to an API token """
+        payload = {
+            'app_key': '9iBEhpigPgRkUjM3dK3B4blkA',
+            'app_secret': 'AVg3iC954Z3bzpZJNwxINsGhKh3jLDBpmAhZqLSxKqEjSyZMYf',
+            'device_id': str(uuid.uuid1())
+        }
+        r = requests.post(self.BASE_URL + '/authenticate', json=payload)
+        if r.status_code == 200:
+            rsp = r.json()
+            return rsp['access_token']
+
+    def decode(self, code):
         """ Run error correction on chirp and get content """
         print('Found Chirp!')
-        print(chirp)
-        # code = self.ecc_decode(chirp)
-        # r = requests.get(self.BASE_URL + '/' + chirp[2:12])
-        # if r.status_code == 200:
-        #     rsp = r.json()
-        #     # print (chirp_code)
-        #     print('%s' % rsp['data'])
-        #     if rsp['data'].get('url'):
-        #         webbrowser.open(rsp['data']['url'])
+        print(code)
+        code = self.ecc_decode(code)
+        r = requests.get(self.BASE_URL + '/chirps/' + code[2:12], headers=self.headers)
+        if r.status_code == 200:
+            rsp = r.json()
+            print('%s' % rsp['data'])
+            if rsp['data'].get('url'):
+                url = (rsp['data']['url'] if
+                    rsp['data']['url'].startswith('http') else
+                    'http://' + rsp['data']['url']
+                )
+                webbrowser.open(url)
 
     def encode(self, code):
         """ Generate audio data from a chirp string """
         samples = np.array([], dtype=np.int16)
-        # code = self.ecc_encode(code)
+        code = self.ecc_encode(code)
 
         for s in code:
             freq = self.map[s]
@@ -192,14 +218,18 @@ class Chirp():
     def ecc_encode(self, code):
         """ Reed Solomon Error Correction Encoding """
         r = requests.get(self.BASE_URL + '/encode/' + code)
-        rsp = r.json()
-        return rsp['longcode']
+        if r.status_code == 200:
+            rsp = r.json()
+            return rsp['longcode']
+        return code
 
     def ecc_decode(self, longcode):
         """ Reed Solomon Error Correction Decoding """
         r = requests.get(self.BASE_URL + '/decode/' + longcode)
-        rsp = r.json()
-        return rsp['shortcode']
+        if r.status_code == 200:
+            rsp = r.json()
+            return rsp['shortcode']
+        return longcode
 
 
 class DecodeThread(threading.Thread):
@@ -207,10 +237,16 @@ class DecodeThread(threading.Thread):
     def __init__(self, fn, *args):
         self.fn = fn
         self.args = args
-        threading.Thread.__init__(self)
+        self.thread = threading.Thread.__init__(self)
 
     def run(self):
         self.fn(*self.args)
+
+    def stop(self):
+        self.thread.set()
+
+    def stopped(self):
+        return self.thread.isSet()
 
 
 if __name__ == '__main__':
