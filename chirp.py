@@ -12,7 +12,7 @@ import threading
 import webbrowser
 import numpy as np
 
-MIN_AMPLITUDE = 500
+MIN_AMPLITUDE = 100
 SAMPLE_RATE = 44100.0  # Hz
 CHAR_DURATION = 0.0872  # secs
 
@@ -98,6 +98,7 @@ class Chirp():
 
     def __init__(self):
         self.chirp = ''
+        self.amplitude = MIN_AMPLITUDE
         self.map = self.get_map()
         self.chars = sorted(self.map.keys())
         self.dsp = Signal(self.RATE)
@@ -142,14 +143,15 @@ class Chirp():
         """ Callback from pyaudio once a chars worth
             of data is loaded into the buffer """
         audio = np.fromstring(data, dtype=np.int16)
-        if max(audio) > MIN_AMPLITUDE:
+        self.amplitude = np.average(abs(audio)) + MIN_AMPLITUDE
+        if max(audio) > self.amplitude:
             thread = DecodeThread(self.process, audio)
             thread.start()
         return (None, pyaudio.paContinue)
 
     def process(self, data):
-        """ Search for any chirps in the data, once the
-            frontdoor pair is received, keep processing. """
+        """ Process data to chirp characters and add to a window
+            Once the frontdoor pair is located, decode the chirp """
         chirplen = len(self.chirp)
         freq = self.dsp.max_freq(data)
         ch, f = min(self.map.items(), key=lambda kv: abs(kv[1] - freq))
