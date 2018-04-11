@@ -1,40 +1,41 @@
 #!/usr/bin/env python
 """
-Chirp.io Encoder/Decoder
+Chirp Encoder/Decoder
 """
 import sys
 import time
-import uuid
-import string
+import codecs
 import pyaudio
-import requests
 import argparse
+import reedsolo
 import threading
-import webbrowser
 import numpy as np
 
 MIN_AMPLITUDE = 100
 SAMPLE_RATE = 44100.0  # Hz
-CHAR_DURATION = 0.0872  # secs
+MESSAGE_LENGTH = 0.08  # secs
 
 
-class Audio():
-    """ Audio Processing """
+class Audio(object):
+    """
+    Audio Processing
+    """
     CHANNELS = 1
-    HUMAN_RANGE = 20000
     FORMAT = pyaudio.paInt16
     RATE = int(SAMPLE_RATE)
-    CHUNK = int(SAMPLE_RATE * CHAR_DURATION)
+    CHUNK = int(SAMPLE_RATE * MESSAGE_LENGTH)
 
     def __init__(self, callback):
+        self.stream = None
         self.audio = pyaudio.PyAudio()
         self.callback = callback
 
     def __del__(self):
-        try:
-            self.audio.terminate()
-        except:
-            pass
+        self.audio.terminate()
+
+    def close(self):
+        if self.stream:
+            self.stream.stop_stream()
 
     def record(self):
         self.stream = self.audio.open(
@@ -47,7 +48,7 @@ class Audio():
         )
 
     def play(self, frames):
-        """ Write data to system audio buffer"""
+        """ Write data to system audio buffer """
         stream = self.audio.open(format=pyaudio.paInt16,
                                  channels=1,
                                  rate=self.RATE,
@@ -57,9 +58,10 @@ class Audio():
         stream.close()
 
 
-class Signal():
-    """ Digital Signal Processing """
-
+class Signal(object):
+    """
+    Digital Signal Processing
+    """
     def __init__(self, fs):
         self.fs = float(fs)  # sampling frequency
 
@@ -87,69 +89,54 @@ class Signal():
         return np.sin(2 * np.pi * np.arange(self.fs * duration) * freq / self.fs)
 
 
-class Chirp():
-    """ Chirp Encoding/Decoding
-        chirp.io/technology """
-    RATE = SAMPLE_RATE
-    CHAR_LENGTH = CHAR_DURATION  # duration of one chirp character - 87.2ms
-    CHAR_SAMPLES = CHAR_LENGTH * RATE  # number of samples in one chirp character
-    CHIRP_SAMPLES = CHAR_SAMPLES * 20  # number of samples in an entire chirp
-    CHIRP_VOLUME = 2 ** 16 / 48  # quarter of max amplitude
-    BASE_URL = 'https://api.chirp.io/v1'
+class Chirp(object):
+    """
+    Chirp Encoding/Decoding
+    """
+    CHIRP_VOLUME = 2 ** 16 / 4  # quarter of max amplitude
+    STANDARD_PROTOCOL = {
+        'frontdoor': [16, 48], 'frontdoor_length': 0.12,
+        'message_length': 0.08, 'max_length': 32,
+        'rs_length_min': 8, 'rs_length_max': 20
+    }
+    ULTRASONIC_PROTOCOL = {
+        'frontdoor': [7, 4], 'frontdoor_length': 0.16,
+        'message_length': 0.08, 'max_length': 8,
+        'rs_length_min': 8, 'rs_length_max': 20
+    }
 
-    def __init__(self):
-        self.chirp = ''
+    def __init__(self, protocol):
+        self.payload = []
+        self.last_heard = 0
+        self.decoding = False
         self.amplitude = MIN_AMPLITUDE
-        self.map = self.get_map()
-        self.device = str(uuid.uuid1())
-        self.chars = sorted(self.map.keys())
-        self.dsp = Signal(self.RATE)
-        self.token = self.authenticate()
-        self.headers = {'X-Auth-Token': self.token}
+        self.protocol = (self.STANDARD_PROTOCOL if protocol == 'standard'
+            else self.ULTRASONIC_PROTOCOL)
+        self.map = (self.get_standard_map() if protocol == 'standard'
+            else self.get_ultrasonic_map())
+        self.dsp = Signal(SAMPLE_RATE)
 
-    def get_map(self):
-        """ Construct map of chirp characters to frequencies
-            0 = 1760Hz 1 = 1864Hz v = 10.5kHz """
-        a6 = 1760
-        a = 2 ** (1 / 12.0)
-        # characters range from 0-9 and a-v
-        chars = string.digits + string.ascii_letters[0:22]
-        d = {}
+    def get_map(self, base_freq, interval, size):
+        """ Construct map of frequencies """
+        return [n for n in range(
+            base_freq,
+            base_freq + (interval * size),
+            interval)]
 
-        for n in range(0, 32):
-            d[chars[n]] = a6 * (a ** n)
+    def get_standard_map(self):
+        """ Construct map of frequencies for standard protocol """
+        return self.get_map(1500, 45, 2 ** 8)
 
-        return d
-
-    def get_code(self, url):
-        """ Request a long code from chirp API """
-        try:
-            payload = {
-                'public': True,
-                'data': {'url': url}
-            }
-            r = requests.post(
-                self.BASE_URL + '/chirps',
-                headers = self.headers,
-                json=payload
-            )
-            if r.status_code == 201:
-                rsp = r.json()
-                if 'longcode' in rsp:
-                    return 'hj' + rsp['longcode']
-                elif 'error' in rsp:
-                    print(rsp['description'])
-                    sys.exit(-1)
-        except:
-            print('Server failed to respond')
-            sys.exit(-1)
+    def get_ultrasonic_map(self):
+        """ Construct map of frequencies for ultrasonic protocol """
+        return self.get_map(18200, 55, 2 ** 5)
 
     def get_char(self, data):
         """ Find maximum frequency in fft data then find the closest
-            frequency in chirp map and return character """
+            frequency in chirp map and return the value """
         freq = self.dsp.max_freq(data)
-        ch, f = min(self.map.items(), key=lambda kv: abs(kv[1] - freq))
-        return ch
+        f = min(self.map, key=lambda v: abs(v - freq))
+        return self.map.index(f)
 
     def callback(self, data, frames, info, status):
         """ Callback from pyaudio once a chars worth
@@ -162,74 +149,89 @@ class Chirp():
         return (None, pyaudio.paContinue)
 
     def process(self, data):
-        """ Process data to chirp characters and add to a window
-            Once the frontdoor pair is located, decode the chirp """
-        chirplen = len(self.chirp)
+        """ Send data off to a processing thread
+            Once the frontdoor pair is located, decode the payload """
         freq = self.dsp.max_freq(data)
-        ch, f = min(self.map.items(), key=lambda kv: abs(kv[1] - freq))
+        f = min(self.map, key=lambda v: abs(v - freq))
 
-        self.chirp += ch
-        chirplen = len(self.chirp)
-        self.chirp = self.chirp[1:] if chirplen > 20 else self.chirp
-        if chirplen >= 20 and self.chirp[0:2] == 'hj':
-            self.decode(self.chirp)
+        v = self.map.index(f)
+        if self.decoding:
+            self.payload.append(v)
+            self.decode()
 
-    def authenticate(self):
-        """ Convert an app key/secret to an API token """
-        payload = {
-            'app_key': '9iBEhpigPgRkUjM3dK3B4blkA',
-            'app_secret': 'AVg3iC954Z3bzpZJNwxINsGhKh3jLDBpmAhZqLSxKqEjSyZMYf',
-            'device_id': str(uuid.uuid1())
-        }
-        r = requests.post(self.BASE_URL + '/authenticate', json=payload)
-        if r.status_code == 200:
-            rsp = r.json()
-            return rsp['access_token']
+        if self.last_heard == self.protocol['frontdoor'][0] and v == self.protocol['frontdoor'][1]:
+            print('Receiving...')
+            self.decoding = True
 
-    def decode(self, code):
-        """ Run error correction on chirp and get content """
-        print('Found Chirp!')
-        print(code)
-        code = self.ecc_decode(code)
-        r = requests.get(self.BASE_URL + '/chirps/' + code[2:12], headers=self.headers)
-        if r.status_code == 200:
-            rsp = r.json()
-            print('%s' % rsp['data'])
-            if rsp['data'].get('url'):
-                url = (rsp['data']['url'] if
-                    rsp['data']['url'].startswith('http') else
-                    'http://' + rsp['data']['url']
-                )
-                webbrowser.open(url)
+        self.last_heard = v
 
-    def encode(self, code):
-        """ Generate audio data from a chirp string """
+    def decode(self):
+        """ Decode audio data """
+        if self.payload and self.payload[0] == self.protocol['frontdoor'][-1]:
+            self.payload = self.payload[1:]
+        if self.payload:
+            length = self.payload[0] + self.get_rs_length(self.payload[0]) + 1
+            if len(self.payload) == length:
+                print('Received')
+                message_length = self.payload.pop(0)
+                print(self.rs_decode(self.payload, message_length))
+                self.payload = []
+                self.decoding = False
+
+    def encode(self, payload):
+        """ Generate audio data from a payload """
         samples = np.array([], dtype=np.int16)
-        code = self.ecc_encode(code)
+        frontdoor = self.protocol['frontdoor']
+        frontdoor.append(len(payload))
+        payload = self.rs_encode(payload)
 
-        for s in code:
+        for s in frontdoor:
             freq = self.map[s]
-            char = self.dsp.sine_wave(freq, self.CHAR_LENGTH)
+            char = self.dsp.sine_wave(freq, self.protocol['frontdoor_length'])
+            samples = np.concatenate([samples, char])
+
+        for s in payload:
+            freq = self.map[s]
+            char = self.dsp.sine_wave(freq, self.protocol['message_length'])
             samples = np.concatenate([samples, char])
 
         samples = (samples * self.CHIRP_VOLUME).astype(np.int16)
         return samples
 
-    def ecc_encode(self, code):
-        """ Reed Solomon Error Correction Encoding """
-        r = requests.get(self.BASE_URL + '/encode/' + code)
-        if r.status_code == 200:
-            rsp = r.json()
-            return rsp['longcode']
-        return code
+    def hex_encode(self, payload):
+        """ Convert payload to hex string """
+        return codecs.encode(bytearray(payload), 'hex-codec')
 
-    def ecc_decode(self, longcode):
+    def hex_decode(self, hex):
+        """ Convert hex string to payload """
+        return codecs.decode(hex, 'hex-codec')
+
+    def get_rs_length(self, length):
+        """ Get reed solomon length """
+        rs_length_range = self.protocol['rs_length_max'] - self.protocol['rs_length_min']
+        message_length_normalised = float(length - 1) / float(self.protocol['max_length'] - 1)
+        return self.protocol['rs_length_min'] + int(message_length_normalised * rs_length_range)
+
+    def rs_encode(self, payload):
+        """ Reed Solomon Error Correction Encoding """
+        rsl = self.get_rs_length(len(payload))
+        padded = [0] * (255 - len(payload))
+        for i in range(0, len(payload)):
+            padded[i] = payload[i]
+        rs = reedsolo.RSCodec(nsym=rsl, fcr=1)
+        payload.extend(list(rs.encode(padded))[-rsl:])
+        return payload
+
+    def rs_decode(self, payload, length):
         """ Reed Solomon Error Correction Decoding """
-        r = requests.get(self.BASE_URL + '/decode/' + longcode)
-        if r.status_code == 200:
-            rsp = r.json()
-            return rsp['shortcode']
-        return longcode
+        padded = [0] * 255
+        for i in range(0, length):
+            padded[i] = payload[i]
+        parity = payload[length:]
+        for i in range(0, len(parity)):
+            padded[255 - len(parity) + i] = parity[i]
+        rs = reedsolo.RSCodec(nsym=len(parity), fcr=1)
+        return list(rs.decode(padded))[:length]
 
 
 class DecodeThread(threading.Thread):
@@ -250,38 +252,39 @@ class DecodeThread(threading.Thread):
 
 
 if __name__ == '__main__':
-    parser = argparse.ArgumentParser(description='Chirp.io Encoder/Decoder')
-    parser.add_argument('-l', '--listen', action='store_true', default=False, help='listen out for a chirp')
-    parser.add_argument('-u', '--url', help='chirp a url')
-    parser.add_argument('-c', '--code', help='chirp a code')
+    parser = argparse.ArgumentParser(description='Chirp Encoder/Decoder')
+    parser.add_argument('-p', '--protocol', default='standard', help='Protocol: either standard or ultrasonic')
+    parser.add_argument('-x', '--hex', help='Send a hex string payload to the speakers')
+    parser.add_argument('-b', '--bytes', nargs='+', type=int, help='Send an array of bytes to the speakers')
+    parser.add_argument('-s', '--string', help='Send an ascii string payload to the speakers')
     args = parser.parse_args()
 
-    chirp = Chirp()
+    chirp = Chirp(protocol=args.protocol)
     audio = Audio(chirp.callback)
 
-    if args.listen:
+    if args.bytes:
+        samples = chirp.encode(args.bytes)
+        print('Chirping payload: %s' % chirp.hex_encode(args.bytes).decode())
+        audio.play(samples)
+    elif args.hex:
+        payload = [ord(ch) for ch in chirp.hex_decode(args.hex)]
+        samples = chirp.encode(payload)
+        print('Chirping payload: %s' % args.hex)
+        audio.play(samples)
+    elif args.string:
+        payload = [ord(ch) for ch in args.string]
+        samples = chirp.encode(payload)
+        print('Chirping payload: %s' % args.string)
+        audio.play(samples)
+    else:
         try:
             print('Recording...')
             audio.record()
             time.sleep(300)
 
         except KeyboardInterrupt:
-            print('Exiting..')
-            sys.exit(0)
+            pass
 
-    elif args.code:
-        samples = chirp.encode(args.code)
-        print('Chirping code: %s' % args.code)
-        audio.play(samples)
-
-    elif args.url:
-        code = chirp.get_code(args.url)
-        samples = chirp.encode(code)
-        print('Chirping url: %s' % args.url)
-        audio.play(samples)
-
-    else:
-        print('No arguments specified!')
-        print('Exiting..')
-
+    print('Exiting..')
+    audio.close()
     sys.exit(0)
