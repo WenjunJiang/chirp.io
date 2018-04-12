@@ -8,15 +8,11 @@ import unittest
 class TestChirp(unittest.TestCase):
 
     def setUp(self):
-        self.chirp = chirp.Chirp(protocol='standard')
+        self.chirp = chirp.Chirp()
 
     def test_get_standard_map(self):
         m = self.chirp.get_standard_map()
         self.assertEqual(len(m), 256)
-
-    def test_get_ultrasonic_map(self):
-        m = self.chirp.get_ultrasonic_map()
-        self.assertEqual(len(m), 32)
 
     def test_get_rs_length(self):
         l = self.chirp.get_rs_length(5)

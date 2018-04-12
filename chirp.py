@@ -96,24 +96,16 @@ class Chirp(object):
     CHIRP_VOLUME = 2 ** 16 / 4  # quarter of max amplitude
     STANDARD_PROTOCOL = {
         'frontdoor': [16, 48], 'frontdoor_length': 0.12,
-        'message_length': 0.08, 'max_length': 32,
-        'rs_length_min': 8, 'rs_length_max': 20
-    }
-    ULTRASONIC_PROTOCOL = {
-        'frontdoor': [7, 4], 'frontdoor_length': 0.16,
-        'message_length': 0.08, 'max_length': 8,
-        'rs_length_min': 8, 'rs_length_max': 20
+        'message_length': 0.08, 'max_length': 32
     }
 
-    def __init__(self, protocol):
+    def __init__(self):
         self.payload = []
-        self.last_heard = 0
+        self.window = []
+        self.last_heard = None
         self.decoding = False
-        self.amplitude = MIN_AMPLITUDE
-        self.protocol = (self.STANDARD_PROTOCOL if protocol == 'standard'
-            else self.ULTRASONIC_PROTOCOL)
-        self.map = (self.get_standard_map() if protocol == 'standard'
-            else self.get_ultrasonic_map())
+        self.protocol = self.STANDARD_PROTOCOL
+        self.map = self.get_standard_map()
         self.dsp = Signal(SAMPLE_RATE)
 
     def get_map(self, base_freq, interval, size):
@@ -127,10 +119,6 @@ class Chirp(object):
         """ Construct map of frequencies for standard protocol """
         return self.get_map(1500, 45, 2 ** 8)
 
-    def get_ultrasonic_map(self):
-        """ Construct map of frequencies for ultrasonic protocol """
-        return self.get_map(18200, 55, 2 ** 5)
-
     def get_char(self, data):
         """ Find maximum frequency in fft data then find the closest
             frequency in chirp map and return the value """
@@ -139,19 +127,16 @@ class Chirp(object):
         return self.map.index(f)
 
     def callback(self, data, frames, info, status):
-        """ Callback from pyaudio once a chars worth
+        """ Callback from pyaudio once a bytes worth
             of data is loaded into the buffer """
-        audio = np.fromstring(data, dtype=np.int16)
-        self.amplitude = np.average(abs(audio)) + MIN_AMPLITUDE
-        if max(audio) > self.amplitude:
-            thread = DecodeThread(self.process, audio)
-            thread.start()
+        DecodeThread(self.process, data).start()
         return (None, pyaudio.paContinue)
 
     def process(self, data):
         """ Send data off to a processing thread
             Once the frontdoor pair is located, decode the payload """
-        freq = self.dsp.max_freq(data)
+        audio = np.fromstring(data, dtype=np.int16)
+        freq = self.dsp.max_freq(audio)
         f = min(self.map, key=lambda v: abs(v - freq))
 
         v = self.map.index(f)
@@ -208,19 +193,20 @@ class Chirp(object):
 
     def get_rs_length(self, length):
         """ Get reed solomon length """
-        rs_length_range = self.protocol['rs_length_max'] - self.protocol['rs_length_min']
+        rs_length_range = 32 - 8
         message_length_normalised = float(length - 1) / float(self.protocol['max_length'] - 1)
-        return self.protocol['rs_length_min'] + int(message_length_normalised * rs_length_range)
+        return 8 + int(message_length_normalised * rs_length_range)
 
     def rs_encode(self, payload):
         """ Reed Solomon Error Correction Encoding """
         rsl = self.get_rs_length(len(payload))
-        padded = [0] * (255 - len(payload))
+        padded = [0] * (255 - rsl)
         for i in range(0, len(payload)):
             padded[i] = payload[i]
         rs = reedsolo.RSCodec(nsym=rsl, fcr=1)
-        payload.extend(list(rs.encode(padded))[-rsl:])
-        return payload
+        encoded = payload[:]
+        encoded.extend(list(rs.encode(padded))[-rsl:])
+        return encoded
 
     def rs_decode(self, payload, length):
         """ Reed Solomon Error Correction Decoding """
@@ -230,8 +216,11 @@ class Chirp(object):
         parity = payload[length:]
         for i in range(0, len(parity)):
             padded[255 - len(parity) + i] = parity[i]
-        rs = reedsolo.RSCodec(nsym=len(parity), fcr=1)
-        return list(rs.decode(padded))[:length]
+        try:
+            rs = reedsolo.RSCodec(nsym=len(parity), fcr=1)
+            return list(rs.decode(padded))[:length]
+        except reedsolo.ReedSolomonError:
+            print('Decode failed')
 
 
 class DecodeThread(threading.Thread):
@@ -253,13 +242,12 @@ class DecodeThread(threading.Thread):
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description='Chirp Encoder/Decoder')
-    parser.add_argument('-p', '--protocol', default='standard', help='Protocol: either standard or ultrasonic')
     parser.add_argument('-x', '--hex', help='Send a hex string payload to the speakers')
     parser.add_argument('-b', '--bytes', nargs='+', type=int, help='Send an array of bytes to the speakers')
     parser.add_argument('-s', '--string', help='Send an ascii string payload to the speakers')
     args = parser.parse_args()
 
-    chirp = Chirp(protocol=args.protocol)
+    chirp = Chirp()
     audio = Audio(chirp.callback)
 
     if args.bytes:

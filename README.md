@@ -1,5 +1,5 @@
-Chirp.io
-========
+Chirp Encoder / Decoder
+=======================
 
 Chirp is an interesting platform that allows you to share data using sound. This Python script lets you to convert a message into an audible chirp and vice versa.
 
@@ -26,26 +26,26 @@ Usage
 -----
 
 Listen for data
-```python
+```shell
 python chirp.py
 ```
 
 Send a hex string payload
-```python
+```shell
 python chirp.py -x 68656c6c6f
 ```
 
 Send an array of bytes
-```python
+```shell
 python chirp.py -b 104 101 108 108 111
 ```
 
 Send an ascii string payload
-```python
+```shell
 python chirp.py -s hello
 ```
 
 Listen in ultrasonic mode
-```python
+```shell
 python chirp.py -p ultrasonic
 ```
