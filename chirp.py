@@ -201,9 +201,8 @@ class Chirp(object):
 
     def get_rs_length(self, length):
         """ Get reed solomon length """
-        rs_length_range = 32 - 8
         message_length_normalised = float(length - 1) / float(self.protocol['max_length'] - 1)
-        return 8 + int(message_length_normalised * rs_length_range)
+        return 8 + int(message_length_normalised * (20 - 8))
 
     def rs_encode(self, payload):
         """ Reed Solomon Error Correction Encoding """
