@@ -45,6 +45,11 @@ Send an ascii string payload
 python chirp.py -s hello
 ```
 
+Save an ascii string payload to wav file
+```shell
+python chirp.py -s hello -w test.wav
+```
+
 Listen in ultrasonic mode
 ```shell
 python chirp.py -p ultrasonic

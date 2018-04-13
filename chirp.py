@@ -4,6 +4,7 @@ Chirp Encoder/Decoder
 """
 import sys
 import time
+import wave
 import codecs
 import pyaudio
 import argparse
@@ -56,6 +57,13 @@ class Audio(object):
         stream.write(frames, len(frames))
         stream.stop_stream()
         stream.close()
+
+    def save(self, filename, frames):
+        """ Save to wav file """
+        f = wave.open(filename, 'wb')
+        f.setparams((self.CHANNELS, 2, self.RATE, 0, 'NONE', 'not compressed'))
+        f.writeframes(frames.tostring())
+        f.close()
 
 
 class Signal(object):
@@ -245,10 +253,12 @@ if __name__ == '__main__':
     parser.add_argument('-x', '--hex', help='Send a hex string payload to the speakers')
     parser.add_argument('-b', '--bytes', nargs='+', type=int, help='Send an array of bytes to the speakers')
     parser.add_argument('-s', '--string', help='Send an ascii string payload to the speakers')
+    parser.add_argument('-w', '--wavfile', help='Filename to write wav file')
     args = parser.parse_args()
 
     chirp = Chirp()
     audio = Audio(chirp.callback)
+    samples = None
 
     if args.bytes:
         samples = chirp.encode(args.bytes)
@@ -272,6 +282,9 @@ if __name__ == '__main__':
 
         except KeyboardInterrupt:
             pass
+
+    if samples is not None and args.wavfile:
+        audio.save(args.wavfile, samples)
 
     print('Exiting..')
     audio.close()
